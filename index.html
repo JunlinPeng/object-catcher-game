@@ -5,6 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Object Catcher — AI Webcam Game</title>
 
+  <!-- PWA — install as a real desktop app -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0a0a0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Object Catcher">
+  <meta name="description" content="AI-powered webcam game — catch falling objects with real-world items using COCO-SSD object detection.">
+
   <!-- ============================================================
    p5.js — Creative coding library (canvas, drawing, math)
    ml5.js — Machine learning library wrapping TensorFlow.js models
@@ -101,17 +108,94 @@
       color: rgba(255, 255, 255, 0.5);
       letter-spacing: 0.03em;
     }
+
+    /* ── Loading progress stages ───────────────────────── */
+    .progress-stages {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 24px;
+      width: 260px;
+    }
+
+    .progress-stage {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.35);
+      transition: color 0.4s ease;
+    }
+
+    .progress-stage.done {
+      color: #00ff88;
+    }
+
+    .progress-stage.active {
+      color: #ffffff;
+    }
+
+    .stage-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: rgba(255, 255, 255, 0.15);
+      transition: all 0.4s ease;
+    }
+
+    .progress-stage.done .stage-dot {
+      background: #00ff88;
+      box-shadow: 0 0 8px rgba(0, 255, 136, 0.6);
+    }
+
+    .progress-stage.active .stage-dot {
+      background: #ffffff;
+      animation: pulse-dot 0.8s ease-in-out infinite;
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { box-shadow: 0 0 4px rgba(255,255,255,0.4); }
+      50% { box-shadow: 0 0 14px rgba(255,255,255,0.8); }
+    }
+
+    .stage-label {
+      flex: 1;
+    }
+
+    .stage-hint {
+      font-size: 0.7rem;
+      opacity: 0.6;
+    }
   </style>
 </head>
 <body>
 
   <!-- ════════════════════════════════════════════════════════
-   Loading overlay — fades out once the model & camera are ready
+   Loading overlay with stage-by-stage progress feedback
   ════════════════════════════════════════════════════════════ -->
   <div id="loading-overlay">
     <div class="loader-ring"></div>
-    <span class="label">Initializing Camera &amp; AI Model…</span>
-    <span class="sub-label">COCO-SSD · Object Detection</span>
+    <span class="label" id="loading-main-label">Starting up…</span>
+    <span class="sub-label" id="loading-sub-label"></span>
+    <div class="progress-stages">
+      <div class="progress-stage active" id="stage-camera">
+        <span class="stage-dot"></span>
+        <span class="stage-label">Camera access</span>
+      </div>
+      <div class="progress-stage" id="stage-scripts">
+        <span class="stage-dot"></span>
+        <span class="stage-label">p5.js + ml5.js libraries</span>
+      </div>
+      <div class="progress-stage" id="stage-model">
+        <span class="stage-dot"></span>
+        <span class="stage-label">
+          AI Model (COCO-SSD)
+          <span class="stage-hint" id="stage-model-hint">~15 MB download on first visit</span>
+        </span>
+      </div>
+    </div>
   </div>
 
   <div id="app-container"></div>
@@ -373,7 +457,8 @@
     const c = createCanvas(VIDEO_W, VIDEO_H);
     c.parent('app-container');
 
-    // ── Webcam ──────────────────────────────────────────────
+    // ── Stage 1: Camera ────────────────────────────────────
+    setLoadingStage('camera', 'active', 'Accessing camera…', '');
     video = createCapture(VIDEO);
     video.size(VIDEO_W, VIDEO_H);
     video.hide();
@@ -381,19 +466,50 @@
     // ── Async-safe: detection starts ONLY after video metadata ──
     video.elt.onloadedmetadata = () => {
       console.log('[ObjectCatcher] Video ready, loading COCO-SSD…');
+      // Stage 1 complete, start stage 3 (scripts are loaded by now)
+      setLoadingStage('camera', 'done');
+      setLoadingStage('scripts', 'done');
+      setLoadingStage('model', 'active', 'Downloading AI model…',
+        'First visit: downloading ~15 MB. Cached for next time.');
+
       detector = ml5.objectDetector('cocossd', { threshold: 0.50 }, () => {
         console.log('[ObjectCatcher] Model ready.');
+        setLoadingStage('model', 'done', 'Ready!', '');
         isModelReady = true;
-        hideLoadingOverlay();
-        gameState = 'TITLE';        // ← show title, NOT jump into play
+        setTimeout(() => {
+          hideLoadingOverlay();
+          gameState = 'TITLE';
+        }, 600); // brief pause so user sees all checkmarks
         startDetectionLoop();
       });
     };
   }
 
   /* ═══════════════════════════════════════════════════════════
-     LOADING OVERLAY
+     LOADING OVERLAY — stage management
      ═══════════════════════════════════════════════════════════ */
+
+  /** Update a loading stage dot and the main label text */
+  function setLoadingStage(stageId, state, mainLabel, subLabel) {
+    const el = document.getElementById('stage-' + stageId);
+    if (el) {
+      el.className = 'progress-stage ' + state;
+    }
+    if (mainLabel !== undefined) {
+      const lbl = document.getElementById('loading-main-label');
+      if (lbl) lbl.textContent = mainLabel;
+    }
+    if (subLabel !== undefined) {
+      const sub = document.getElementById('loading-sub-label');
+      if (sub) sub.textContent = subLabel;
+    }
+    // Hide the "~15 MB" hint once model stage is done or active for a bit
+    if (stageId === 'model' && state === 'done') {
+      const hint = document.getElementById('stage-model-hint');
+      if (hint) hint.style.display = 'none';
+    }
+  }
+
   function hideLoadingOverlay() {
     const overlay = document.getElementById('loading-overlay');
     if (overlay) overlay.classList.add('hidden');
@@ -983,6 +1099,19 @@
      ═══════════════════════════════════════════════════════════ */
   function windowResized() {
     resizeCanvas(VIDEO_W, VIDEO_H);
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     PWA — Register service worker for offline caching
+     ═══════════════════════════════════════════════════════════ */
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').then(reg => {
+        console.log('[PWA] Service worker registered:', reg.scope);
+      }).catch(err => {
+        console.warn('[PWA] SW registration failed (expected on file://):', err.message);
+      });
+    });
   }
   </script>
 </body>
