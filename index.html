@@ -205,6 +205,22 @@
         </span>
       </div>
     </div>
+    <div class="progress-bar-track" id="progress-bar-track" style="
+      width: 260px;
+      height: 4px;
+      background: rgba(255,255,255,0.08);
+      border-radius: 2px;
+      margin-top: 16px;
+      overflow: hidden;
+    ">
+      <div id="progress-bar-fill" style="
+        width: 0%;
+        height: 100%;
+        background: linear-gradient(90deg, #00ff88, #00ccff);
+        border-radius: 2px;
+        transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+      "></div>
+    </div>
     <button id="skip-loading-btn" onclick="skipToClickMode()" style="
       display: none;
       margin-top: 28px;
@@ -484,47 +500,85 @@
     const c = createCanvas(VIDEO_W, VIDEO_H);
     c.parent('app-container');
 
+    // Mark scripts as loaded (p5 + ml5 script tags have executed by now)
+    setLoadingStage('scripts', 'done');
+
     // ── Stage 1: Camera ────────────────────────────────────
     setLoadingStage('camera', 'active', 'Accessing camera…', '');
     video = createCapture(VIDEO);
     video.size(VIDEO_W, VIDEO_H);
     video.hide();
 
-    // ── Async-safe: detection starts ONLY after video metadata ──
-    video.elt.onloadedmetadata = () => {
-      console.log('[ObjectCatcher] Video ready, loading COCO-SSD…');
-      // Stage 1 complete, start stage 3 (scripts are loaded by now)
-      setLoadingStage('camera', 'done');
-      setLoadingStage('scripts', 'done');
-      setLoadingStage('model', 'active', 'Downloading AI model…',
-        'First visit: downloading ~15 MB. Cached for next time.');
+    // Track both async tasks — game starts when BOTH are ready
+    let cameraReady = false;
+    let modelReady = false;
 
-      detector = ml5.objectDetector('cocossd', { threshold: 0.50 }, () => {
-        console.log('[ObjectCatcher] Model ready.');
+    function tryStartGame() {
+      if (cameraReady && modelReady) {
         setLoadingStage('model', 'done', 'Ready!', '');
         isModelReady = true;
         if (clickMode) {
-          // Already playing in click mode — fade overlay, show notification
           hideLoadingOverlay();
           floatingTexts.push(new FloatingText(VIDEO_W / 2, VIDEO_H / 2, 'AI READY!', color(0, 255, 180)));
-          clickMode = false; // seamlessly switch to AI mode
+          clickMode = false;
         } else {
           setTimeout(() => {
             hideLoadingOverlay();
             gameState = 'TITLE';
-          }, 600);
+          }, 500);
         }
         startDetectionLoop();
-      });
+      }
+    }
+
+    // ── Camera ready callback ──────────────────────────────
+    video.elt.onloadedmetadata = () => {
+      console.log('[ObjectCatcher] Camera ready.');
+      setLoadingStage('camera', 'done');
+      cameraReady = true;
+      tryStartGame();
     };
 
-    // Show "Play Now" skip button after 1.5 sec if model hasn't loaded yet
+    // ── Start model download IMMEDIATELY (parallel with camera) ──
+    setLoadingStage('model', 'active', 'Downloading AI model…',
+      'First visit: ~15 MB download. Cached for next time.');
+    console.log('[ObjectCatcher] Starting COCO-SSD download (parallel with camera)…');
+
+    // Animated progress bar — makes the wait feel shorter
+    const progressBar = document.getElementById('progress-bar-fill');
+    const progressTrack = document.getElementById('progress-bar-track');
+    let progress = 0;
+    const progressTimer = setInterval(() => {
+      if (modelReady) {
+        // Jump to 100% and hide
+        if (progressBar) progressBar.style.width = '100%';
+        setTimeout(() => { if (progressTrack) progressTrack.style.opacity = '0'; }, 400);
+        clearInterval(progressTimer);
+        return;
+      }
+      // Slow down as we approach 90% (never reaches 100 until actually ready)
+      const remaining = 90 - progress;
+      const increment = max(0.3, remaining * 0.04);
+      progress = min(90, progress + increment);
+      if (progressBar) progressBar.style.width = progress + '%';
+    }, 180);
+
+    detector = ml5.objectDetector('cocossd', { threshold: 0.50 }, () => {
+      console.log('[ObjectCatcher] COCO-SSD model ready.');
+      modelReady = true;
+      clearInterval(progressTimer);
+      if (progressBar) progressBar.style.width = '100%';
+      setTimeout(() => { if (progressTrack) progressTrack.style.opacity = '0'; }, 400);
+      tryStartGame();
+    });
+
+    // Show "Play Now" skip button after 2 sec if model hasn't loaded yet
     setTimeout(() => {
       if (!isModelReady) {
         const btn = document.getElementById('skip-loading-btn');
         if (btn) btn.style.display = 'inline-block';
       }
-    }, 1500);
+    }, 2000);
   }
 
   /* ═══════════════════════════════════════════════════════════
