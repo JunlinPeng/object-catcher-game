@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Object Catcher — AI Webcam Game</title>
+
+  <!-- ============================================================
+   p5.js — Creative coding library (canvas, drawing, math)
+   ml5.js — Machine learning library wrapping TensorFlow.js models
+  ============================================================ -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.10.0/p5.min.js"></script>
+  <script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+
+  <style>
+    /* ── Global Reset & Base ─────────────────────────────── */
+    *, *::before, *::after {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0a0f;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* ── Main Container ─────────────────────────────────── */
+    #app-container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* p5.js injects its own canvas — we target it here */
+    #app-container canvas {
+      display: block;
+      border-radius: 8px;
+      box-shadow: 0 0 80px rgba(0, 255, 136, 0.08), 0 0 200px rgba(0, 200, 255, 0.05);
+      cursor: pointer;
+    }
+
+    /* ── Loading Overlay ────────────────────────────────── */
+    #loading-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(ellipse at center, #0f0f1a 0%, #06060d 100%);
+      transition: opacity 0.7s cubic-bezier(0.4, 0, 0.2, 1);
+      pointer-events: all;
+    }
+
+    #loading-overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* Animated spinner ring */
+    .loader-ring {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      background: conic-gradient(
+        from 0deg,
+        #00ff88, #00ccff, #7b61ff, #ff3d77, #00ff88
+      );
+      animation: spin-ring 1.4s linear infinite;
+      mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 5px));
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 5px));
+      margin-bottom: 28px;
+    }
+
+    @keyframes spin-ring {
+      to { transform: rotate(360deg); }
+    }
+
+    #loading-overlay .label {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: #ffffff;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    #loading-overlay .sub-label {
+      margin-top: 8px;
+      font-size: 0.85rem;
+      font-weight: 400;
+      color: rgba(255, 255, 255, 0.5);
+      letter-spacing: 0.03em;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ════════════════════════════════════════════════════════
+   Loading overlay — fades out once the model & camera are ready
+  ════════════════════════════════════════════════════════════ -->
+  <div id="loading-overlay">
+    <div class="loader-ring"></div>
+    <span class="label">Initializing Camera &amp; AI Model…</span>
+    <span class="sub-label">COCO-SSD · Object Detection</span>
+  </div>
+
+  <div id="app-container"></div>
+
+  <script>
+  /* ═══════════════════════════════════════════════════════════
+     OBJECT CATCHER — AI Webcam Game
+     Uses: p5.js (rendering) + ml5.js (COCO-SSD object detection)
+
+     Game States: LOADING → TITLE → PLAYING → GAME_OVER → TITLE
+     ═══════════════════════════════════════════════════════════ */
+
+  // ── Global State ───────────────────────────────────────────
+  let video;              // p5.MediaElement — webcam capture
+  let detector;           // ml5.ObjectDetector (COCO-SSD)
+  let detections = [];    // Latest detection results
+  let isModelReady = false;
+  let detectionInFlight = false; // Prevent overlapping detect() calls
+
+  // ── Game State Machine ──────────────────────────────────────
+  let gameState   = 'LOADING';   // LOADING | TITLE | PLAYING | GAME_OVER
+  let score       = 0;
+  let lives       = 5;
+  let highScore   = 0;           // loaded from localStorage
+  let comboCount  = 0;           // consecutive catches within window
+  let comboTimer  = 0;           // frames remaining in combo window
+  let missFlashAlpha = 0;        // red vignette fade
+
+  // ── Game Objects ────────────────────────────────────────────
+  let apples        = [];
+  let particles     = [];
+  let floatingTexts = [];
+  let lastSpawnFrame = 0;
+
+  // ── Canvas Constants ───────────────────────────────────────
+  const VIDEO_W = 640;
+  const VIDEO_H = 480;
+  const MAX_APPLES = 8;
+  const COMBO_WINDOW = 90;       // frames (~1.5 s at 60 fps)
+
+  // ── Load high score from localStorage ──────────────────────
+  try {
+    const saved = localStorage.getItem('objectCatcherHighScore');
+    if (saved !== null) highScore = parseInt(saved, 10) || 0;
+  } catch (_) { /* localStorage may be blocked */ }
+
+  /* ═══════════════════════════════════════════════════════════
+     PARTICLE — explosion spark
+     ═══════════════════════════════════════════════════════════ */
+  class Particle {
+    constructor(x, y, col) {
+      this.pos   = createVector(x, y);
+      const angle = random(TWO_PI);
+      const speed = random(2.5, 9);
+      this.vel   = p5.Vector.fromAngle(angle, speed);
+      this.acc   = createVector(0, 0.15);
+      this.life  = 1.0;
+      this.decay = random(0.018, 0.045);
+      this.size  = random(3, 9);
+      this.col   = col;
+    }
+    update() {
+      this.vel.add(this.acc);
+      this.pos.add(this.vel);
+      this.life -= this.decay;
+    }
+    draw() {
+      noStroke();
+      const alpha = map(this.life, 0, 1, 0, 255);
+      fill(red(this.col), green(this.col), blue(this.col), alpha);
+      ellipse(this.pos.x, this.pos.y, this.size);
+    }
+    get isDead() { return this.life <= 0; }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     FLOATING TEXT — score popup that floats up and fades
+     ═══════════════════════════════════════════════════════════ */
+  class FloatingText {
+    constructor(x, y, txt, col) {
+      this.pos   = createVector(x, y);
+      this.vel   = createVector(random(-0.5, 0.5), -2.5);
+      this.txt   = txt;
+      this.col   = col;
+      this.life  = 1.0;
+      this.decay = 0.022;
+      this.size  = txt.length > 2 ? 22 : 18;
+    }
+    update() {
+      this.pos.add(this.vel);
+      this.life -= this.decay;
+    }
+    draw() {
+      const alpha = map(this.life, 0, 1, 0, 255);
+      fill(red(this.col), green(this.col), blue(this.col), alpha);
+      noStroke();
+      textFont('Segoe UI, system-ui, sans-serif');
+      textStyle(BOLD);
+      textSize(this.size);
+      textAlign(CENTER, CENTER);
+      text(this.txt, this.pos.x, this.pos.y);
+    }
+    get isDead() { return this.life <= 0; }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     APPLE — falling game object (normal / golden / bomb)
+     ═══════════════════════════════════════════════════════════ */
+  class Apple {
+    constructor() {
+      this.x  = random(30, VIDEO_W - 30);
+      this.y  = random(-70, -15);
+      this.r  = random(14, 22);
+      this.vy = random(1.8 + score * 0.05, 4.2 + score * 0.08);
+
+      // ── Determine type by weighted random ──────────────────
+      const roll = random(100);
+      if (roll < 8) {
+        this.type = 'bomb';
+      } else if (roll < 20) {
+        this.type = 'golden';
+      } else {
+        this.type = 'apple';
+      }
+
+      this.hue    = random(0, 20);
+      this.spin   = random(TWO_PI);       // golden rotation
+      this.fuseTimer = random(0, TWO_PI); // bomb fuse flicker
+    }
+
+    update() {
+      this.y += this.vy;
+      this.spin += 0.08;
+      this.fuseTimer += 0.3;
+    }
+
+    draw() {
+      push();
+      translate(this.x, this.y);
+
+      if (this.type === 'apple') {
+        this._drawApple();
+      } else if (this.type === 'golden') {
+        this._drawGolden();
+      } else if (this.type === 'bomb') {
+        this._drawBomb();
+      }
+
+      pop();
+    }
+
+    /* ── Normal red apple ────────────────────────────────── */
+    _drawApple() {
+      noStroke();
+      fill(220 + this.hue, 80, 50);
+      ellipse(0, 0, this.r * 2);
+
+      fill(255, 255, 255, 100);
+      ellipse(-this.r * 0.25, -this.r * 0.35, this.r * 0.45, this.r * 0.45);
+
+      stroke(80, 160, 60);
+      strokeWeight(2);
+      line(0, -this.r, this.r * 0.35, -this.r * 1.5);
+
+      noStroke();
+      fill(80, 200, 80);
+      ellipse(this.r * 0.45, -this.r * 1.3, this.r * 0.5, this.r * 0.25);
+    }
+
+    /* ── Golden apple — shimmering, glowing ──────────────── */
+    _drawGolden() {
+      drawingContext.shadowBlur = 20;
+      drawingContext.shadowColor = 'rgba(255, 215, 0, 0.8)';
+
+      noStroke();
+      fill(255, 215, 0);
+      ellipse(0, 0, this.r * 2);
+
+      // Sparkle cross
+      push();
+      rotate(this.spin);
+      stroke(255, 255, 200, 200);
+      strokeWeight(1.5);
+      const s = this.r * 0.6;
+      line(-s, 0, s, 0);
+      line(0, -s, 0, s);
+      pop();
+
+      fill(255, 255, 255, 130);
+      ellipse(-this.r * 0.2, -this.r * 0.3, this.r * 0.4, this.r * 0.4);
+
+      stroke(120, 100, 40);
+      strokeWeight(2);
+      line(0, -this.r, this.r * 0.3, -this.r * 1.4);
+
+      drawingContext.shadowBlur = 0;
+    }
+
+    /* ── Bomb — dark with pulsing fuse ──────────────────── */
+    _drawBomb() {
+      drawingContext.shadowBlur = 14;
+      drawingContext.shadowColor = 'rgba(255, 60, 40, 0.6)';
+
+      noStroke();
+      fill(30, 30, 35);
+      ellipse(0, 0, this.r * 2);
+
+      // Fuse spark
+      const sparkAlpha = map(sin(this.fuseTimer), -1, 1, 100, 255);
+      fill(255, 180, 30, sparkAlpha);
+      ellipse(0, -this.r, this.r * 0.3, this.r * 0.3);
+      fill(255, 80, 30, sparkAlpha * 0.7);
+      ellipse(0, -this.r, this.r * 0.15, this.r * 0.15);
+
+      // Fuse wire
+      stroke(120, 80, 50);
+      strokeWeight(1.5);
+      noFill();
+      beginShape();
+      for (let i = 0; i < 6; i++) {
+        const fy = -this.r - i * 3;
+        const fx = sin(this.fuseTimer + i * 0.8) * 4;
+        vertex(fx, fy);
+      }
+      endShape();
+
+      // Skull-like highlight
+      fill(60, 60, 70, 120);
+      ellipse(-this.r * 0.2, -this.r * 0.3, this.r * 0.4, this.r * 0.4);
+
+      drawingContext.shadowBlur = 0;
+    }
+
+    get isOffScreen() {
+      return this.y - this.r > VIDEO_H + 40;
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     PROGRESSIVE DIFFICULTY — faster spawns as score rises
+     ═══════════════════════════════════════════════════════════ */
+  function getSpawnInterval() {
+    const baseMin = max(14, 60 - score * 2);
+    const baseMax = max(24, 90 - score * 2);
+    return int(random(baseMin, baseMax));
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     p5.js — preload()
+     ═══════════════════════════════════════════════════════════ */
+  function preload() {
+    // COCO-SSD loads lazily via ml5.objectDetector() in setup()
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     p5.js — setup()
+     ═══════════════════════════════════════════════════════════ */
+  function setup() {
+    const c = createCanvas(VIDEO_W, VIDEO_H);
+    c.parent('app-container');
+
+    // ── Webcam ──────────────────────────────────────────────
+    video = createCapture(VIDEO);
+    video.size(VIDEO_W, VIDEO_H);
+    video.hide();
+
+    // ── Async-safe: detection starts ONLY after video metadata ──
+    video.elt.onloadedmetadata = () => {
+      console.log('[ObjectCatcher] Video ready, loading COCO-SSD…');
+      detector = ml5.objectDetector('cocossd', { threshold: 0.50 }, () => {
+        console.log('[ObjectCatcher] Model ready.');
+        isModelReady = true;
+        hideLoadingOverlay();
+        gameState = 'TITLE';        // ← show title, NOT jump into play
+        startDetectionLoop();
+      });
+    };
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     LOADING OVERLAY
+     ═══════════════════════════════════════════════════════════ */
+  function hideLoadingOverlay() {
+    const overlay = document.getElementById('loading-overlay');
+    if (overlay) overlay.classList.add('hidden');
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     INPUT HANDLERS — click / space to start or restart
+     ═══════════════════════════════════════════════════════════ */
+  function mousePressed() {
+    if (gameState === 'TITLE') {
+      resetGame();
+      gameState = 'PLAYING';
+    } else if (gameState === 'GAME_OVER') {
+      resetGame();
+      gameState = 'PLAYING';
+    }
+    // Prevent default to avoid any browser interaction
+    return false;
+  }
+
+  function keyPressed() {
+    if (key === ' ' || keyCode === ENTER) {
+      if (gameState === 'TITLE') {
+        resetGame();
+        gameState = 'PLAYING';
+      } else if (gameState === 'GAME_OVER') {
+        resetGame();
+        gameState = 'PLAYING';
+      }
+      return false;
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     RESET GAME — clear all state for a fresh round
+     ═══════════════════════════════════════════════════════════ */
+  function resetGame() {
+    score       = 0;
+    lives       = 5;
+    comboCount  = 0;
+    comboTimer  = 0;
+    missFlashAlpha = 0;
+    apples.length        = 0;
+    particles.length     = 0;
+    floatingTexts.length = 0;
+    lastSpawnFrame = frameCount;
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     DETECTION LOOP — safe, self-recovering (anti-lockup)
+     ═══════════════════════════════════════════════════════════ */
+  function startDetectionLoop() {
+    if (!isModelReady || !detector) return;
+    detectFrame();
+  }
+
+  function detectFrame() {
+    if (!isModelReady || detectionInFlight) return;
+    detectionInFlight = true;
+
+    try {
+      detector.detect(video.elt, (err, results) => {
+        detectionInFlight = false;
+        if (err) {
+          console.warn('[ObjectCatcher] Detection error:', err);
+          detections = [];
+          scheduleNextDetection(80);
+          return;
+        }
+        detections = Array.isArray(results) ? results : [];
+        scheduleNextDetection(0);
+      });
+    } catch (ex) {
+      console.error('[ObjectCatcher] Fatal detection crash:', ex);
+      detectionInFlight = false;
+      detections = [];
+      scheduleNextDetection(200);
+    }
+  }
+
+  function scheduleNextDetection(delayMs) {
+    if (delayMs > 0) {
+      setTimeout(() => detectFrame(), delayMs);
+    } else {
+      requestAnimationFrame(() => detectFrame());
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     COLLISION DETECTION — AABB circle overlap (mirrored coords)
+     ═══════════════════════════════════════════════════════════ */
+  function checkAppleCollision(apple) {
+    for (const d of detections) {
+      if (!d || !d.label) continue;
+
+      // Mirror X for the flipped canvas
+      const canvasX = VIDEO_W - d.x - d.width;
+      const canvasY = d.y;
+
+      // Closest point on AABB to circle center
+      const closestX = constrain(apple.x, canvasX, canvasX + d.width);
+      const closestY = constrain(apple.y, canvasY, canvasY + d.height);
+      const distX = apple.x - closestX;
+      const distY = apple.y - closestY;
+
+      if (distX * distX + distY * distY < apple.r * apple.r) {
+        return { box: d, canvasX, canvasY };
+      }
+    }
+    return null;
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     VISUAL EFFECTS
+     ═══════════════════════════════════════════════════════════ */
+
+  function spawnBurst(x, y, palette) {
+    for (let i = 0; i < 14; i++) {
+      particles.push(new Particle(x, y, random(palette)));
+    }
+  }
+
+  function spawnRedBurst(x, y) {
+    const reds = [
+      color(255, 50, 50), color(255, 100, 30),
+      color(255, 30, 80), color(200, 40, 40),
+      color(255, 80, 60),
+    ];
+    for (let i = 0; i < 8; i++) {
+      particles.push(new Particle(x, y, random(reds)));
+    }
+  }
+
+  /** Trigger a red vignette flash when the player misses an apple */
+  function triggerMissEffect(x) {
+    missFlashAlpha = 80;
+    spawnRedBurst(x, VIDEO_H - 10);
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     p5.js — draw() — master render loop
+     ═══════════════════════════════════════════════════════════ */
+  function draw() {
+    background(12, 12, 22);
+
+    /* ── Always render mirrored webcam ────────────────────── */
+    push();
+    translate(VIDEO_W, 0);
+    scale(-1, 1);
+    image(video, 0, 0, VIDEO_W, VIDEO_H);
+    pop();
+
+    // Subtle dark overlay for contrast
+    noStroke();
+    fill(0, 0, 0, 25);
+    rect(0, 0, VIDEO_W, VIDEO_H);
+
+    /* ── State-dependent rendering ────────────────────────── */
+    switch (gameState) {
+      case 'LOADING':
+        // Loading overlay is HTML; nothing extra to draw here.
+        break;
+
+      case 'TITLE':
+        drawBoundingBoxes();
+        drawTitleScreen();
+        break;
+
+      case 'PLAYING':
+        drawBoundingBoxes();
+        updateGame();
+        drawApples();
+        drawParticles();
+        drawFloatingTexts();
+        drawMissFlash();
+        drawHUD();
+        break;
+
+      case 'GAME_OVER':
+        drawBoundingBoxes();
+        // Keep last frame's apples & particles visible (static)
+        drawApples();
+        drawParticles();
+        drawFloatingTexts();
+        drawHUD();
+        drawGameOverScreen();
+        break;
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     TITLE SCREEN
+     ═══════════════════════════════════════════════════════════ */
+  function drawTitleScreen() {
+    push();
+
+    // Dark overlay
+    fill(0, 0, 0, 160);
+    noStroke();
+    rect(0, 0, VIDEO_W, VIDEO_H);
+
+    textFont('Segoe UI, system-ui, sans-serif');
+    textAlign(CENTER, CENTER);
+
+    // ── Title ──────────────────────────────────────────────
+    drawingContext.shadowBlur = 30;
+    drawingContext.shadowColor = 'rgba(0, 255, 180, 0.8)';
+    fill(0, 255, 180);
+    textStyle(BOLD);
+    textSize(48);
+    text('OBJECT CATCHER', VIDEO_W / 2, VIDEO_H / 2 - 80);
+    drawingContext.shadowBlur = 0;
+
+    // ── Tagline ────────────────────────────────────────────
+    fill(255, 255, 255, 200);
+    textStyle(NORMAL);
+    textSize(15);
+    text('Use real objects to catch falling fruit!', VIDEO_W / 2, VIDEO_H / 2 - 38);
+
+    // ── Instructions ───────────────────────────────────────
+    const instructions = [
+      '🖐️  Show objects to your webcam',
+      '🍎  Catch apples with the bounding boxes',
+      '⭐  Golden apples = +3 points!',
+      '💣  Avoid the bombs — they cost a life!',
+    ];
+    textSize(13);
+    fill(255, 255, 255, 160);
+    for (let i = 0; i < instructions.length; i++) {
+      text(instructions[i], VIDEO_W / 2, VIDEO_H / 2 + 10 + i * 26);
+    }
+
+    // ── High score ─────────────────────────────────────────
+    if (highScore > 0) {
+      fill(255, 215, 0, 200);
+      textSize(14);
+      textStyle(BOLD);
+      text(`🏆  High Score: ${highScore}`, VIDEO_W / 2, VIDEO_H / 2 + 120);
+    }
+
+    // ── CTA (pulsing) ──────────────────────────────────────
+    const pulse = map(sin(frameCount * 0.06), -1, 1, 160, 255);
+    fill(255, 255, 255, pulse);
+    textStyle(BOLD);
+    textSize(17);
+    text('🖱️  CLICK  or  press  SPACE  to start', VIDEO_W / 2, VIDEO_H / 2 + 165);
+
+    pop();
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     GAME OVER SCREEN
+     ═══════════════════════════════════════════════════════════ */
+  function drawGameOverScreen() {
+    push();
+
+    // Dark overlay
+    fill(0, 0, 0, 180);
+    noStroke();
+    rect(0, 0, VIDEO_W, VIDEO_H);
+
+    textFont('Segoe UI, system-ui, sans-serif');
+    textAlign(CENTER, CENTER);
+
+    // ── Title ──────────────────────────────────────────────
+    drawingContext.shadowBlur = 24;
+    drawingContext.shadowColor = 'rgba(255, 80, 80, 0.7)';
+    fill(255, 80, 80);
+    textStyle(BOLD);
+    textSize(50);
+    text('GAME OVER', VIDEO_W / 2, VIDEO_H / 2 - 70);
+    drawingContext.shadowBlur = 0;
+
+    // ── Final score ────────────────────────────────────────
+    fill(0, 255, 180);
+    textSize(36);
+    text(score, VIDEO_W / 2, VIDEO_H / 2 - 10);
+
+    fill(255, 255, 255, 140);
+    textStyle(NORMAL);
+    textSize(13);
+    text('FINAL SCORE', VIDEO_W / 2, VIDEO_H / 2 - 42);
+
+    // ── High score logic ───────────────────────────────────
+    const isNewHigh = score > highScore;
+    if (isNewHigh) {
+      highScore = score;
+      try { localStorage.setItem('objectCatcherHighScore', highScore); } catch (_) {}
+
+      fill(255, 215, 0, 220);
+      textStyle(BOLD);
+      textSize(18);
+      text('🏆  NEW HIGH SCORE!  🏆', VIDEO_W / 2, VIDEO_H / 2 + 40);
+    } else {
+      fill(255, 255, 255, 150);
+      textStyle(NORMAL);
+      textSize(14);
+      text(`🏆  Best: ${highScore}`, VIDEO_W / 2, VIDEO_H / 2 + 40);
+    }
+
+    // ── Restart CTA ────────────────────────────────────────
+    const pulse = map(sin(frameCount * 0.06), -1, 1, 150, 255);
+    fill(255, 255, 255, pulse);
+    textStyle(BOLD);
+    textSize(16);
+    text('🖱️  Click  or  press  SPACE  to play again', VIDEO_W / 2, VIDEO_H / 2 + 85);
+
+    pop();
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     GAME UPDATE — spawn, collide, combo, lives, difficulty
+     ═══════════════════════════════════════════════════════════ */
+  function updateGame() {
+    // ── Combo timer decay ──────────────────────────────────
+    if (comboTimer > 0) {
+      comboTimer--;
+      if (comboTimer <= 0) comboCount = 0;
+    }
+
+    // ── Spawn apples (progressive difficulty) ──────────────
+    const interval = getSpawnInterval();
+    if (frameCount - lastSpawnFrame > interval && apples.length < MAX_APPLES) {
+      apples.push(new Apple());
+      lastSpawnFrame = frameCount;
+    }
+
+    // ── Miss flash decay ───────────────────────────────────
+    if (missFlashAlpha > 0) missFlashAlpha = max(0, missFlashAlpha - 2.5);
+
+    // ── Update floating texts ──────────────────────────────
+    for (let i = floatingTexts.length - 1; i >= 0; i--) {
+      floatingTexts[i].update();
+      if (floatingTexts[i].isDead) floatingTexts.splice(i, 1);
+    }
+
+    // ── Update apples & collisions ─────────────────────────
+    for (let i = apples.length - 1; i >= 0; i--) {
+      const a = apples[i];
+      a.update();
+
+      const hit = checkAppleCollision(a);
+      if (hit) {
+        handleCatch(a, i);
+        continue;
+      }
+
+      // Fell off screen = miss
+      if (a.isOffScreen) {
+        handleMiss(a, i);
+      }
+    }
+
+    // ── Update particles ───────────────────────────────────
+    for (let i = particles.length - 1; i >= 0; i--) {
+      particles[i].update();
+      if (particles[i].isDead) particles.splice(i, 1);
+    }
+  }
+
+  /**
+   * Handle a caught apple — apply type-specific effects.
+   */
+  function handleCatch(apple, index) {
+    if (apple.type === 'bomb') {
+      // ── Bomb: lose a life, red explosion ──────────────────
+      lives--;
+      spawnRedBurst(apple.x, apple.y);
+      floatingTexts.push(new FloatingText(apple.x, apple.y, '💥 -1', color(255, 60, 40)));
+      missFlashAlpha = 60;
+      comboCount = 0;
+      comboTimer = 0;
+    } else if (apple.type === 'golden') {
+      // ── Golden: +3 points, gold burst ────────────────────
+      const points = 3;
+      score += points;
+      comboCount++;
+      comboTimer = COMBO_WINDOW;
+      const goldPalette = [color(255, 215, 0), color(255, 240, 100), color(255, 180, 0), color(255, 255, 200)];
+      spawnBurst(apple.x, apple.y, goldPalette);
+      const label = comboCount >= 3 ? `+${points}  COMBO ×${comboCount}!` : `+${points}`;
+      floatingTexts.push(new FloatingText(apple.x, apple.y, label, color(255, 215, 0)));
+    } else {
+      // ── Normal apple: +1 point, rainbow burst ────────────
+      score++;
+      comboCount++;
+      comboTimer = COMBO_WINDOW;
+      const palette = [
+        color(255, 77, 109), color(255, 180, 50), color(0, 255, 136),
+        color(0, 200, 255), color(180, 100, 255), color(255, 255, 80), color(255, 130, 200),
+      ];
+      spawnBurst(apple.x, apple.y, palette);
+      const label = comboCount >= 3 ? `+1  COMBO ×${comboCount}!` : '+1';
+      floatingTexts.push(new FloatingText(apple.x, apple.y, label, color(0, 255, 180)));
+    }
+
+    apples.splice(index, 1);
+
+    // ── Check game over ────────────────────────────────────
+    if (lives <= 0) {
+      lives = 0;
+      gameState = 'GAME_OVER';
+    }
+  }
+
+  /**
+   * Handle an apple that fell off screen.
+   * Normal/golden apples cost a life; bombs are harmless on miss.
+   */
+  function handleMiss(apple, index) {
+    if (apple.type !== 'bomb') {
+      lives--;
+      triggerMissEffect(apple.x);
+      comboCount = 0;
+      comboTimer = 0;
+    }
+    // Bombs: no penalty for missing — they just disappear
+    apples.splice(index, 1);
+
+    if (lives <= 0) {
+      lives = 0;
+      gameState = 'GAME_OVER';
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     DRAW FUNCTIONS
+     ═══════════════════════════════════════════════════════════ */
+
+  function drawApples() {
+    for (const a of apples) a.draw();
+  }
+
+  function drawParticles() {
+    for (const p of particles) p.draw();
+  }
+
+  function drawFloatingTexts() {
+    for (const ft of floatingTexts) ft.draw();
+  }
+
+  /** Red vignette flash when player misses */
+  function drawMissFlash() {
+    if (missFlashAlpha > 0) {
+      noStroke();
+      fill(255, 30, 30, missFlashAlpha);
+      rect(0, 0, VIDEO_W, VIDEO_H);
+    }
+  }
+
+  function drawBoundingBoxes() {
+    if (!detections || detections.length === 0) return;
+
+    textFont('Segoe UI, system-ui, sans-serif');
+    textStyle(BOLD);
+
+    for (const d of detections) {
+      if (!d || !d.label) continue;
+
+      const canvasX = VIDEO_W - d.x - d.width;
+      const canvasY = d.y;
+      const w = d.width;
+      const h = d.height;
+      const confidence = d.confidence ? nf(d.confidence * 100, 0, 1) : '??';
+
+      push();
+
+      drawingContext.shadowBlur = 18;
+      drawingContext.shadowColor = 'rgba(0, 255, 200, 0.7)';
+
+      strokeWeight(3);
+      stroke(0, 255, 180, 230);
+      noFill();
+      rect(canvasX, canvasY, w, h, 10);
+
+      drawingContext.shadowBlur = 0;
+
+      const labelText = `${d.label.toUpperCase()}  ${confidence}%`;
+      textSize(13);
+      const tw = textWidth(labelText) + 14;
+      const th = 22;
+      const labelY = canvasY - th - 4;
+
+      if (labelY > 0) {
+        fill(0, 255, 180, 220);
+        noStroke();
+        rect(canvasX, labelY, tw, th, 6);
+
+        fill(0, 0, 0);
+        textSize(13);
+        textAlign(LEFT, TOP);
+        text(labelText, canvasX + 7, labelY + 4);
+      }
+
+      pop();
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     HUD — score, lives, combo, status
+     ═══════════════════════════════════════════════════════════ */
+  function drawHUD() {
+    push();
+
+    // ── Score badge ────────────────────────────────────────
+    const badgeX = 16;
+    const badgeY = 16;
+    const badgeW = 200;
+    const badgeH = 60;
+
+    fill(0, 0, 0, 145);
+    stroke(255, 255, 255, 20);
+    strokeWeight(1);
+    rect(badgeX, badgeY, badgeW, badgeH, 14);
+
+    noStroke();
+    fill(255, 255, 255, 150);
+    textFont('Segoe UI, system-ui, sans-serif');
+    textSize(10);
+    textStyle(NORMAL);
+    textAlign(LEFT, TOP);
+    text('SCORE', badgeX + 16, badgeY + 10);
+
+    fill(0, 255, 180);
+    textSize(28);
+    textStyle(BOLD);
+    textAlign(LEFT, CENTER);
+    text(score, badgeX + 16, badgeY + 38);
+
+    // ── Lives (hearts) ─────────────────────────────────────
+    textSize(16);
+    textAlign(RIGHT, CENTER);
+    let heartsStr = '';
+    for (let i = 0; i < lives; i++) heartsStr += '❤️';
+    for (let i = lives; i < 5; i++) heartsStr += '🖤';
+    text(heartsStr, badgeX + badgeW - 14, badgeY + 26);
+
+    // ── Active apples count ────────────────────────────────
+    fill(255, 255, 255, 120);
+    textSize(11);
+    textStyle(NORMAL);
+    text(`🍎×${apples.length}`, badgeX + badgeW - 14, badgeY + 46);
+
+    pop();
+
+    // ── Combo indicator (center-top) ───────────────────────
+    if (comboCount >= 3 && comboTimer > 0) {
+      push();
+      const comboAlpha = map(comboTimer, 0, COMBO_WINDOW, 60, 255);
+      fill(255, 215, 0, comboAlpha);
+      textFont('Segoe UI, system-ui, sans-serif');
+      textStyle(BOLD);
+      textSize(18);
+      textAlign(CENTER, TOP);
+      text(`🔥  COMBO ×${comboCount}!`, VIDEO_W / 2, badgeY + 8);
+      pop();
+    }
+
+    // ── Detection status dot ────────────────────────────────
+    const dotX = VIDEO_W - 28;
+    const dotY = 30;
+    const isDetecting = detections.length > 0;
+
+    fill(isDetecting ? color(0, 255, 136) : color(255, 100, 100));
+    noStroke();
+    ellipse(dotX, dotY, 9);
+
+    fill(255, 255, 255, 150);
+    textFont('Segoe UI, system-ui, sans-serif');
+    textSize(10);
+    textStyle(NORMAL);
+    textAlign(RIGHT, CENTER);
+    text(isDetecting ? `${detections.length} objects` : 'searching…', dotX - 16, dotY);
+
+    // ── Difficulty indicator ────────────────────────────────
+    const diffLevel = min(5, floor(score / 5));
+    fill(255, 255, 255, 100);
+    textSize(9);
+    textAlign(LEFT, CENTER);
+    let diffStr = 'Speed: ';
+    for (let i = 0; i < 5; i++) diffStr += i < diffLevel ? '●' : '○';
+    text(diffStr, badgeX + badgeW + 12, badgeY + badgeH / 2);
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     Handle window resize
+     ═══════════════════════════════════════════════════════════ */
+  function windowResized() {
+    resizeCanvas(VIDEO_W, VIDEO_H);
+  }
+  </script>
+</body>
+</html>
